@@ -1,0 +1,72 @@
+#include "mlu.h"
+#define ROUND 256
+__mlu_entry__ void gemm16Kernel(half *outputDDR, int8_t *input1DDR, int8_t *input2DDR,
+	uint32_t m, uint32_t k, uint32_t n, int16_t pos) {
+	__nram__ int8_t input1NRAM[256*256];
+	__nram__ int8_t input2NRAM[256*256];
+	__nram__ int8_t input2NRAM_tmp[256*256];
+	__wram__ int8_t input2WRAM[256*256];
+	__nram__ half outputNRAM[256*256];
+	__memcpy(input1NRAM, input1DDR, m * k * sizeof(int8_t), GDRAM2NRAM); 
+							//在这里将左矩阵一次性拷入NRAM
+	
+    int all_round = n / (taskDim * ROUND);   //因为现在使用16个核同时运算，所以每个核循环的次数也相应减少
+    int32_t dst_stride = (ROUND * k / 64) * sizeof(int8_t);
+    int32_t src_stride = k * sizeof(int8_t);
+    int32_t size = k * sizeof(int8_t);
+    int32_t total_times = ROUND / 64;
+    // 访存和计算流水化
+    __mlu_shared__ int8_t input2SRAM1[256*1024];
+    __mlu_shared__ int8_t input2SRAM2[256*1024];
+    __mlu_shared__ int8_t * input2SRAM_read;
+    __mlu_shared__ int8_t * input2SRAM_write;
+    
+    // 以cluster为单位拷贝各自需要的右矩阵部分
+    input2SRAM_write = input2SRAM1;
+    __memcpy(input2SRAM_write, input2DDR + ROUND * (clusterId * 4 * all_round) * k,
+                k * ROUND * (4 * all_round) * sizeof(int8_t), GDRAM2SRAM);
+
+    //_bang_printf("taskDim=%d,clusterId=%d,coreId=%d\n",taskDim,clusterId,coreId);
+    for(int i = 0; i < all_round; i++)
+    {
+        // copy GDRAM2SRAM
+        // 将右矩阵拷入SRAM
+        //__memcpyz(input2SRAM, input2DDR + ROUND * k * i + ROUND * k * all_round * taskId,
+        //            ROUND * k * sizeof(int8_t), GDRAM2SRAM);
+
+        //__sync_cluster();   //设置sync barrier
+        
+        // 流水化
+        if(i % 2 == 0){
+            input2SRAM_read = input2SRAM1;
+            input2SRAM_write = input2SRAM2;
+        }
+        else{
+            input2SRAM_read = input2SRAM2;
+            input2SRAM_write = input2SRAM1;
+        }
+
+        // copy SRAM2NRAM
+        // 以core为单位从cluster中的SRAM中将需要的数据读入自己的NRAM
+        __memcpy(input2NRAM_tmp, input2SRAM_read + ROUND * k * i + ROUND * k * (coreId * all_round), 
+                    k * ROUND * sizeof(int8_t), SRAM2NRAM);
+
+        for (int j = 0; j < total_times; j++) {
+            __memcpy(input2NRAM + j * k, input2NRAM_tmp + j * 64 * k,
+                                     size, NRAM2NRAM, dst_stride, src_stride, 64);
+        }
+
+        // copy NRAM2WRAM
+        __memcpy(input2WRAM, input2NRAM, ROUND * k * sizeof(int8_t), NRAM2WRAM);
+
+        // compute
+        __bang_conv(outputNRAM, input1NRAM, input2WRAM, k, m, 1, 1, 1, 1, 1, ROUND, pos);
+
+        // copy NRAM2GDRAM
+        for (int j = 0; j < m; j++) {  
+              __memcpy(outputDDR + (i * taskDim + taskId) * ROUND + j * n,   
+                        outputNRAM + j * ROUND, ROUND * sizeof(half), NRAM2GDRAM);
+        }
+        __sync_cluster();   //设置sync barrier
+    }
+}
